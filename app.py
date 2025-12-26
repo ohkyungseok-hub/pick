@@ -58,7 +58,7 @@ def build_picking_sheet(src_path: str, out_path: str, colmap=None):
 
     df_sorted = df_sel.sort_values(
         by=["주소", "상품연동코드"],
-        ascending=[True, False],
+        ascending=[True, True],
         kind="mergesort",
     )
 
