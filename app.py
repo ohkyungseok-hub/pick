@@ -1,11 +1,11 @@
-import io
 import tempfile
 from pathlib import Path
+from copy import copy
 
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.pagebreak import Break
 from openpyxl.utils import get_column_letter
 
@@ -78,25 +78,78 @@ def build_picking_sheet(src_path: str, out_path: str, colmap=None):
     df_final = pd.concat(out_chunks, ignore_index=True)
     df_final.to_excel(out_path, index=False)
 
-    # 서식/인쇄 설정
+    # ---------------- openpyxl 서식/인쇄 설정 ----------------
     wb = load_workbook(out_path)
     ws = wb.active
 
-    header_font = Font(bold=True)
+    # 헤더 스타일 (굵게 + 줄바꿈)
+    header_font = Font(bold=True, sz=15)
     header_align = Alignment(wrap_text=True, vertical="center")
     for c in range(1, ws.max_column + 1):
         cell = ws.cell(1, c)
         cell.font = header_font
         cell.alignment = header_align
 
+    # 헤더 맵
     headers = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
     addr_col = headers["주소"]
+    code_col = headers["상품연동코드"]
+    qty_col = headers["주문수량"]
+    product_col = headers["주문상품"]
 
+    # 긴 텍스트 줄바꿈 + 위쪽 정렬
     wrap_top = Alignment(wrap_text=True, vertical="top")
     for r in range(2, ws.max_row + 1):
         for name in ["주문상품", "옵션", "주소", "주문요청사항"]:
             ws.cell(r, headers[name]).alignment = wrap_top
 
+    # 1) 전체 폰트 크기 15로 통일(헤더 포함)
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(r, c)
+            f = copy(cell.font)
+            f.sz = 15
+            cell.font = f
+
+    # 2) 상품연동코드 값이 바뀔 때마다 행 음영 토글
+    fill_gray = PatternFill(fill_type="solid", fgColor="E6E6E6")
+    fill_none = PatternFill()
+
+    shade_on = False
+    prev_code = None
+
+    for r in range(2, ws.max_row + 1):
+        code = ws.cell(r, code_col).value
+        prod = ws.cell(r, product_col).value
+
+        # 합계행은 토글 기준에서 제외 (바로 위 그룹 음영 유지)
+        if str(prod).strip() != "합계":
+            if code is not None and str(code).strip() != "":
+                if prev_code is None:
+                    prev_code = code
+                elif code != prev_code:
+                    shade_on = not shade_on
+                    prev_code = code
+
+        row_fill = fill_gray if shade_on else fill_none
+        for c in range(1, ws.max_column + 1):
+            ws.cell(r, c).fill = row_fill
+
+        # 3) 주문수량이 2 이상이면 빨간색 (합계행 제외)
+        if str(prod).strip() != "합계":
+            v = ws.cell(r, qty_col).value
+            try:
+                q = float(v)
+            except Exception:
+                q = None
+
+            if q is not None and q >= 2:
+                qty_cell = ws.cell(r, qty_col)
+                f = copy(qty_cell.font)
+                f.color = "FF0000"
+                qty_cell.font = f
+
+    # 열 너비
     widths = {
         "상품연동코드": 18,
         "주문상품": 60,
@@ -109,12 +162,14 @@ def build_picking_sheet(src_path: str, out_path: str, colmap=None):
     for name, w in widths.items():
         ws.column_dimensions[get_column_letter(headers[name])].width = w
 
+    # 인쇄 설정
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.print_title_rows = "1:1"
 
+    # 주소 바뀔 때마다 페이지 나누기
     ws.row_breaks.brk = []
     if ws.max_row >= 2:
         prev_addr = ws.cell(2, addr_col).value
@@ -149,7 +204,6 @@ uploaded = st.file_uploader("원본 엑셀(.xlsx)을 업로드하세요", type=[
 
 if uploaded is not None:
     st.info(f"업로드 파일: {uploaded.name}")
-
     out_name = st.text_input("결과 파일명", value=f"picking_{Path(uploaded.name).stem}.xlsx")
 
     if st.button("✅ 피킹시트 만들기", use_container_width=True):
@@ -159,13 +213,8 @@ if uploaded is not None:
                     src_path = Path(td) / "src.xlsx"
                     out_path = Path(td) / "out.xlsx"
 
-                    # 업로드 파일 저장
                     src_path.write_bytes(uploaded.getbuffer())
-
-                    # 생성
                     build_picking_sheet(str(src_path), str(out_path), colmap=colmap)
-
-                    # 결과를 bytes로 읽기
                     data = out_path.read_bytes()
 
             st.success("완료! 아래 버튼으로 다운로드하세요.")
