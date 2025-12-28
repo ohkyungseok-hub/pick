@@ -1,8 +1,8 @@
-# pick.py
+# app.py
 # 사용법:
-#   python pick.py "원본.xlsx" "결과.xlsx"
-#   python pick.py "원본.xlsx" "결과.xlsx" --docx "결과.docx"
-#   python pick.py "원본.xlsx" "결과.xlsx" --docx "결과.docx" --skip-xlsx
+#   python app.py "원본.xlsx" "결과.xlsx"
+#   python app.py "원본.xlsx" "결과.xlsx" --docx "결과.docx"
+#   python app.py "원본.xlsx" "결과.xlsx" --docx "결과.docx" --skip-xlsx
 #
 # 요구 라이브러리:
 #   pip install pandas openpyxl python-docx
@@ -190,15 +190,12 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
     style.font.size = Pt(9)
 
     # 주소별로 끊기(주소가 변경될 때마다 한 페이지)
-    # df_final은 이미 주소별로 모여 있고, 합계행도 포함되어 있음
-    # -> 주소값이 바뀌는 지점으로 그룹을 만든다.
     groups = []
     current_addr = None
     current_rows = []
 
     for _, row in df_final.iterrows():
         addr = "" if pd.isna(row["주소"]) else str(row["주소"]).strip()
-        # 합계행도 주소를 갖고 있으니, 주소 그룹 기준은 동일하게 유지됨
         if current_addr is None:
             current_addr = addr
             current_rows = [row]
@@ -212,9 +209,9 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
         groups.append((current_addr, current_rows))
 
     # 컬럼 순서 고정
-    cols = required_cols[:]  # ["상품연동코드",...,"주문요청사항"]
+    cols = required_cols[:]
 
-    # 세로모드 열 너비(인치) - 화면/인쇄에서 ‘잘 보이게’ 배분
+    # 세로모드 열 너비(인치)
     col_widths = {
         "상품연동코드": Inches(0.8),
         "주문상품": Inches(2.4),
@@ -254,7 +251,6 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
         for r in rows_in_addr:
             is_sum = (str(r.get("주문상품", "")) == "합계") or ("합계" in str(r.get("주문상품", "")))
 
-            # 코드 토글 기준: 합계행은 토글/음영 계산에서 제외(원래 사양 유지)
             code_val = "" if pd.isna(r["상품연동코드"]) else str(r["상품연동코드"])
             if not is_sum:
                 if code_val != last_code:
@@ -271,7 +267,7 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
                 cell = row.cells[ci]
                 cell.width = col_widths[name]
 
-                # 합계행: 주소칸 비움(요구사항)
+                # 합계행: 주소칸 비움
                 if is_sum and name == "주소":
                     cell.text = ""
                     continue
@@ -281,7 +277,6 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
 
                 run = cell.paragraphs[0].add_run(text)
 
-                # 폰트 규칙(최종 확정)
                 if name == "주소":
                     run.font.size = Pt(5)
                 elif name in ("주문상품", "옵션"):
@@ -299,7 +294,6 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
                 else:
                     run.font.size = Pt(8)
 
-                # 합계행 전체 강조(16pt Bold) + 주소칸은 비움 처리됨
                 if is_sum:
                     run.font.size = Pt(16)
                     run.bold = True
@@ -318,9 +312,6 @@ def build_picking_sheet(
     skip_xlsx: bool = False,
 ):
     if colmap is None:
-        # 원본 기준:
-        # 상품연동코드 J, 주문상품 K, 옵션 L,
-        # 주문수량 N, 주문회원 Q, 주소 V, 주문요청사항 W
         colmap = {
             "상품연동코드": "J",
             "주문상품": "K",
@@ -331,14 +322,11 @@ def build_picking_sheet(
             "주문요청사항": "W",
         }
 
-    # 1) DF 생성
     df_final = build_picking_dataframe(src_path, colmap)
 
-    # 2) 엑셀 저장(선택)
     if not skip_xlsx:
         build_picking_xlsx(df_final, out_xlsx_path)
 
-    # 3) 워드 저장(선택)
     if out_docx_path:
         build_picking_docx(df_final, out_docx_path)
 
