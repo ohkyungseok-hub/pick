@@ -1,15 +1,16 @@
-# app.py
-# 사용법:
-#   python app.py "원본.xlsx" "결과.xlsx"
-#   python app.py "원본.xlsx" "결과.xlsx" --docx "결과.docx"
-#   python app.py "원본.xlsx" "결과.xlsx" --docx "결과.docx" --skip-xlsx
+# app.py (Streamlit 버전)
+# 실행:
+#   streamlit run app.py
 #
 # 요구 라이브러리:
-#   pip install pandas openpyxl python-docx
+#   pip install streamlit pandas openpyxl python-docx
 
-import sys
-import argparse
+import io
+import tempfile
+from pathlib import Path
+
 import pandas as pd
+import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.worksheet.pagebreak import Break
@@ -24,6 +25,9 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, Inches, RGBColor
 
 
+# -----------------------
+# 공통 로직(원본 pick.py 그대로)
+# -----------------------
 def excel_col_to_zero_index(col_letter: str) -> int:
     """Excel column letter (e.g., 'A', 'J') -> pandas zero-based index"""
     col_letter = col_letter.strip().upper()
@@ -49,7 +53,7 @@ def build_picking_dataframe(src_path: str, colmap: dict) -> pd.DataFrame:
     df_sorted = df_sel.sort_values(
         by=["주소", "상품연동코드"],
         ascending=[True, False],
-        kind="mergesort"
+        kind="mergesort",
     )
 
     # 주소별 합계행 추가
@@ -92,7 +96,7 @@ def build_picking_xlsx(df_final: pd.DataFrame, out_path: str) -> None:
         for name in ["주문상품", "옵션", "주소", "주문요청사항"]:
             ws.cell(r, headers[name]).alignment = wrap_top
 
-    # 열 너비(기존 유지)
+    # 열 너비
     widths = {
         "상품연동코드": 18,
         "주문상품": 60,
@@ -105,7 +109,7 @@ def build_picking_xlsx(df_final: pd.DataFrame, out_path: str) -> None:
     for name, w in widths.items():
         ws.column_dimensions[get_column_letter(headers[name])].width = w
 
-    # 인쇄 설정(기존 유지: 가로)
+    # 인쇄 설정(가로)
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
@@ -119,7 +123,7 @@ def build_picking_xlsx(df_final: pd.DataFrame, out_path: str) -> None:
         for r in range(3, ws.max_row + 1):
             curr_addr = ws.cell(r, addr_col).value
             if curr_addr != prev_addr:
-                ws.row_breaks.append(Break(id=r - 1))  # 이전 행 뒤에서 끊기
+                ws.row_breaks.append(Break(id=r - 1))
                 prev_addr = curr_addr
 
     ws.print_area = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
@@ -189,7 +193,7 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
     style._element.rPr.rFonts.set(qn("w:eastAsia"), "맑은 고딕")
     style.font.size = Pt(9)
 
-    # 주소별로 끊기(주소가 변경될 때마다 한 페이지)
+    # 주소별로 끊기
     groups = []
     current_addr = None
     current_rows = []
@@ -208,10 +212,8 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
     if current_rows:
         groups.append((current_addr, current_rows))
 
-    # 컬럼 순서 고정
     cols = required_cols[:]
 
-    # 세로모드 열 너비(인치)
     col_widths = {
         "상품연동코드": Inches(0.8),
         "주문상품": Inches(2.4),
@@ -234,7 +236,7 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
         table.allow_autofit = False
 
-        # 헤더행(8pt) + 행높이 26
+        # 헤더행
         hdr = table.rows[0]
         _docx_set_row_height(hdr, 26)
         for ci, name in enumerate(cols):
@@ -244,7 +246,6 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
             if cell.paragraphs and cell.paragraphs[0].runs:
                 cell.paragraphs[0].runs[0].font.size = Pt(8)
 
-        # 코드 변경 시 음영 토글
         last_code = None
         shade_on = False
 
@@ -272,6 +273,8 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
                     cell.text = ""
                     continue
 
+                # 셀 초기화(빈 문단/중복 방지)
+                cell.text = ""
                 val = r.get(name, "")
                 text = "" if pd.isna(val) else str(val)
 
@@ -304,53 +307,92 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
     doc.save(out_docx)
 
 
-def build_picking_sheet(
-    src_path: str,
-    out_xlsx_path: str,
-    colmap=None,
-    out_docx_path: str | None = None,
-    skip_xlsx: bool = False,
-):
-    if colmap is None:
-        colmap = {
-            "상품연동코드": "J",
-            "주문상품": "K",
-            "옵션": "L",
-            "주문수량": "N",
-            "주문회원": "Q",
-            "주소": "V",
-            "주문요청사항": "W",
-        }
+# -----------------------
+# Streamlit UI
+# -----------------------
+st.set_page_config(page_title="피킹 시트 생성기", layout="wide")
+st.title("피킹 시트 생성기 (Excel → Picking XLSX / DOCX)")
 
-    df_final = build_picking_dataframe(src_path, colmap)
+st.write(
+    "- 원본 엑셀을 업로드하면 **주소별 정렬 + 주소별 합계행**을 만들고\n"
+    "- 선택에 따라 **피킹용 XLSX(가로 인쇄 설정)**, **피킹용 DOCX(A4 세로)**를 생성합니다."
+)
 
-    if not skip_xlsx:
-        build_picking_xlsx(df_final, out_xlsx_path)
+uploaded = st.file_uploader("원본 엑셀 업로드 (.xlsx)", type=["xlsx"])
 
-    if out_docx_path:
-        build_picking_docx(df_final, out_docx_path)
+with st.expander("원본 컬럼 매핑(기본값: J,K,L,N,Q,V,W)"):
+    st.caption("원본 엑셀에서 각 항목이 위치한 열(letter)을 입력하세요. 예: J")
+    default_map = {
+        "상품연동코드": "J",
+        "주문상품": "K",
+        "옵션": "L",
+        "주문수량": "N",
+        "주문회원": "Q",
+        "주소": "V",
+        "주문요청사항": "W",
+    }
+    colmap = {}
+    cols_ui = st.columns(7)
+    keys = list(default_map.keys())
+    for i, k in enumerate(keys):
+        with cols_ui[i]:
+            colmap[k] = st.text_input(k, value=default_map[k], max_chars=3)
 
+make_xlsx = st.checkbox("결과 XLSX 생성", value=True)
+make_docx = st.checkbox("결과 DOCX 생성", value=True)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("src", help='원본 엑셀 경로 (예: "원본.xlsx")')
-    parser.add_argument("out_xlsx", help='결과 엑셀 경로 (예: "결과.xlsx")')
-    parser.add_argument("--docx", dest="out_docx", default=None, help='결과 워드 경로 (예: "결과.docx")')
-    parser.add_argument("--skip-xlsx", action="store_true", help="엑셀 저장 생략(워드만 생성할 때)")
-    args = parser.parse_args()
+base_name = st.text_input("파일명 접두어(다운로드 파일명)", value="picking_result")
 
-    build_picking_sheet(
-        src_path=args.src,
-        out_xlsx_path=args.out_xlsx,
-        out_docx_path=args.out_docx,
-        skip_xlsx=args.skip_xlsx,
-    )
+run_btn = st.button("생성하기", type="primary", disabled=(uploaded is None))
 
-    if not args.skip_xlsx:
-        print(f"엑셀 완료: {args.out_xlsx}")
-    if args.out_docx:
-        print(f"워드 완료: {args.out_docx}")
+if run_btn:
+    if uploaded is None:
+        st.error("원본 엑셀 파일을 업로드하세요.")
+        st.stop()
 
+    if not (make_xlsx or make_docx):
+        st.warning("XLSX 또는 DOCX 중 최소 1개는 선택해야 합니다.")
+        st.stop()
 
-if __name__ == "__main__":
-    main()
+    try:
+        # 업로드 파일을 임시 경로에 저장 (pandas/openpyxl/docx가 경로 기반으로 다루기 쉬움)
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            src_path = td_path / "source.xlsx"
+            src_path.write_bytes(uploaded.getvalue())
+
+            # 1) DF 생성
+            df_final = build_picking_dataframe(str(src_path), colmap)
+
+            st.success("데이터 변환 완료! (주소별 정렬 + 합계행 생성)")
+            st.dataframe(df_final, use_container_width=True, height=360)
+
+            # 2) XLSX 생성
+            if make_xlsx:
+                out_xlsx_path = td_path / f"{base_name}.xlsx"
+                build_picking_xlsx(df_final, str(out_xlsx_path))
+                xlsx_bytes = out_xlsx_path.read_bytes()
+
+                st.download_button(
+                    label="📥 결과 XLSX 다운로드",
+                    data=xlsx_bytes,
+                    file_name=f"{base_name}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            # 3) DOCX 생성
+            if make_docx:
+                out_docx_path = td_path / f"{base_name}.docx"
+                build_picking_docx(df_final, str(out_docx_path))
+                docx_bytes = out_docx_path.read_bytes()
+
+                st.download_button(
+                    label="📥 결과 DOCX 다운로드",
+                    data=docx_bytes,
+                    file_name=f"{base_name}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+
+    except Exception as e:
+        st.error("생성 중 오류가 발생했습니다.")
+        st.exception(e)
