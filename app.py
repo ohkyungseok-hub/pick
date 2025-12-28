@@ -1,16 +1,31 @@
-import tempfile
-from pathlib import Path
-from copy import copy
+# pick.py
+# 사용법:
+#   python pick.py "원본.xlsx" "결과.xlsx"
+#   python pick.py "원본.xlsx" "결과.xlsx" --docx "결과.docx"
+#   python pick.py "원본.xlsx" "결과.xlsx" --docx "결과.docx" --skip-xlsx
+#
+# 요구 라이브러리:
+#   pip install pandas openpyxl python-docx
 
+import sys
+import argparse
 import pandas as pd
-import streamlit as st
 from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Font
 from openpyxl.worksheet.pagebreak import Break
 from openpyxl.utils import get_column_letter
 
+from docx import Document
+from docx.enum.text import WD_BREAK
+from docx.enum.section import WD_ORIENT
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Pt, Inches, RGBColor
+
 
 def excel_col_to_zero_index(col_letter: str) -> int:
+    """Excel column letter (e.g., 'A', 'J') -> pandas zero-based index"""
     col_letter = col_letter.strip().upper()
     n = 0
     for ch in col_letter:
@@ -20,82 +35,56 @@ def excel_col_to_zero_index(col_letter: str) -> int:
     return n - 1
 
 
-def normalize_address(s: pd.Series) -> pd.Series:
-    s = s.fillna("").astype(str)
-    s = s.str.replace("\n", " ", regex=False).str.strip()
-    s = s.str.replace(r"\s+", " ", regex=True)
-    return s
-
-
-def build_picking_sheet(src_path: str, out_path: str, colmap=None):
-    if colmap is None:
-        colmap = {
-            "상품연동코드": "J",
-            "주문상품": "K",
-            "옵션": "L",
-            "주문수량": "N",
-            "주문회원": "Q",
-            "주소": "V",
-            "주문요청사항": "W",
-        }
-
+def build_picking_dataframe(src_path: str, colmap: dict) -> pd.DataFrame:
+    """원본 엑셀 -> 피킹용 DF(주소 정렬 + 주소별 합계행 포함)"""
     df = pd.read_excel(src_path)
 
-    needed = ["상품연동코드", "주문상품", "옵션", "주문수량", "주문회원", "주소", "주문요청사항"]
-    idxs = [excel_col_to_zero_index(colmap[k]) for k in needed]
-
-    max_idx = max(idxs)
-    if df.shape[1] <= max_idx:
-        raise ValueError(
-            f"원본 파일 열 수({df.shape[1]})가 부족합니다. "
-            f"필요한 최대 열: {get_column_letter(max_idx+1)}"
-        )
+    need_keys = ["상품연동코드", "주문상품", "옵션", "주문수량", "주문회원", "주소", "주문요청사항"]
+    idxs = [excel_col_to_zero_index(colmap[k]) for k in need_keys]
 
     df_sel = df.iloc[:, idxs].copy()
-    df_sel.columns = needed
+    df_sel.columns = need_keys
 
-    df_sel["주소"] = normalize_address(df_sel["주소"])
-
+    # 정렬: 주소(오름), 상품연동코드(내림)
     df_sorted = df_sel.sort_values(
         by=["주소", "상품연동코드"],
-        ascending=[True, True],
-        kind="mergesort",
+        ascending=[True, False],
+        kind="mergesort"
     )
 
+    # 주소별 합계행 추가
     out_chunks = []
-    for addr, g in df_sorted.groupby("주소", sort=False, dropna=False):
+    for addr, g in df_sorted.groupby("주소", sort=False):
         out_chunks.append(g)
 
         subtotal = {c: "" for c in df_sorted.columns}
         subtotal["주문상품"] = "합계"
-        qty = pd.to_numeric(g["주문수량"], errors="coerce").fillna(0).sum()
-        qty = int(qty) if float(qty).is_integer() else float(qty)
-
-        subtotal["주문수량"] = qty
+        subtotal_qty = pd.to_numeric(g["주문수량"], errors="coerce").fillna(0).sum()
+        subtotal["주문수량"] = subtotal_qty
         subtotal["주소"] = addr
         out_chunks.append(pd.DataFrame([subtotal]))
 
     df_final = pd.concat(out_chunks, ignore_index=True)
+    return df_final
+
+
+def build_picking_xlsx(df_final: pd.DataFrame, out_path: str) -> None:
+    """DF -> 피킹용 엑셀 저장 + 인쇄/서식 설정(openpyxl)"""
     df_final.to_excel(out_path, index=False)
 
-    # ---------------- openpyxl 서식/인쇄 설정 ----------------
     wb = load_workbook(out_path)
     ws = wb.active
 
-    # 헤더 스타일 (굵게 + 줄바꿈)
-    header_font = Font(bold=True, sz=15)
+    # 헤더: 굵게 + 줄바꿈
+    header_font = Font(bold=True)
     header_align = Alignment(wrap_text=True, vertical="center")
     for c in range(1, ws.max_column + 1):
         cell = ws.cell(1, c)
         cell.font = header_font
         cell.alignment = header_align
 
-    # 헤더 맵
     headers = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
     addr_col = headers["주소"]
-    code_col = headers["상품연동코드"]
-    qty_col = headers["주문수량"]
-    product_col = headers["주문상품"]
 
     # 긴 텍스트 줄바꿈 + 위쪽 정렬
     wrap_top = Alignment(wrap_text=True, vertical="top")
@@ -103,53 +92,7 @@ def build_picking_sheet(src_path: str, out_path: str, colmap=None):
         for name in ["주문상품", "옵션", "주소", "주문요청사항"]:
             ws.cell(r, headers[name]).alignment = wrap_top
 
-    # 1) 전체 폰트 크기 15로 통일(헤더 포함)
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            cell = ws.cell(r, c)
-            f = copy(cell.font)
-            f.sz = 15
-            cell.font = f
-
-    # 2) 상품연동코드 값이 바뀔 때마다 행 음영 토글
-    fill_gray = PatternFill(fill_type="solid", fgColor="E6E6E6")
-    fill_none = PatternFill()
-
-    shade_on = False
-    prev_code = None
-
-    for r in range(2, ws.max_row + 1):
-        code = ws.cell(r, code_col).value
-        prod = ws.cell(r, product_col).value
-
-        # 합계행은 토글 기준에서 제외 (바로 위 그룹 음영 유지)
-        if str(prod).strip() != "합계":
-            if code is not None and str(code).strip() != "":
-                if prev_code is None:
-                    prev_code = code
-                elif code != prev_code:
-                    shade_on = not shade_on
-                    prev_code = code
-
-        row_fill = fill_gray if shade_on else fill_none
-        for c in range(1, ws.max_column + 1):
-            ws.cell(r, c).fill = row_fill
-
-        # 3) 주문수량이 2 이상이면 빨간색 (합계행 제외)
-        if str(prod).strip() != "합계":
-            v = ws.cell(r, qty_col).value
-            try:
-                q = float(v)
-            except Exception:
-                q = None
-
-            if q is not None and q >= 2:
-                qty_cell = ws.cell(r, qty_col)
-                f = copy(qty_cell.font)
-                f.color = "FF0000"
-                qty_cell.font = f
-
-    # 열 너비
+    # 열 너비(기존 유지)
     widths = {
         "상품연동코드": 18,
         "주문상품": 60,
@@ -162,7 +105,7 @@ def build_picking_sheet(src_path: str, out_path: str, colmap=None):
     for name, w in widths.items():
         ws.column_dimensions[get_column_letter(headers[name])].width = w
 
-    # 인쇄 설정
+    # 인쇄 설정(기존 유지: 가로)
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
@@ -176,58 +119,250 @@ def build_picking_sheet(src_path: str, out_path: str, colmap=None):
         for r in range(3, ws.max_row + 1):
             curr_addr = ws.cell(r, addr_col).value
             if curr_addr != prev_addr:
-                ws.row_breaks.append(Break(id=r - 1))
+                ws.row_breaks.append(Break(id=r - 1))  # 이전 행 뒤에서 끊기
                 prev_addr = curr_addr
 
     ws.print_area = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
     wb.save(out_path)
 
 
-# ---------------- Streamlit UI ----------------
+# -----------------------
+# 워드 출력 (세로모드 최종)
+# -----------------------
+def _docx_set_row_height(row, pt: int = 26) -> None:
+    trPr = row._tr.get_or_add_trPr()
+    trHeight = OxmlElement("w:trHeight")
+    trHeight.set(qn("w:val"), str(int(pt * 20)))  # twips
+    trHeight.set(qn("w:hRule"), "exact")
+    trPr.append(trHeight)
 
-st.set_page_config(page_title="피킹시트 생성기", layout="centered")
-st.title("📦 피킹시트 생성기")
-st.caption("엑셀 업로드 → 주소별 정렬/합계/페이지나누기 적용 → 결과 엑셀 다운로드")
+    # 셀 내부 문단 여백 최소화
+    for cell in row.cells:
+        for p in cell.paragraphs:
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
 
-with st.expander("원본 컬럼 위치 설정(기본값: J,K,L,N,Q,V,W)", expanded=False):
-    colmap = {
-        "상품연동코드": st.text_input("상품연동코드 컬럼(예: J)", value="J"),
-        "주문상품": st.text_input("주문상품 컬럼(예: K)", value="K"),
-        "옵션": st.text_input("옵션 컬럼(예: L)", value="L"),
-        "주문수량": st.text_input("주문수량 컬럼(예: N)", value="N"),
-        "주문회원": st.text_input("주문회원 컬럼(예: Q)", value="Q"),
-        "주소": st.text_input("주소 컬럼(예: V)", value="V"),
-        "주문요청사항": st.text_input("주문요청사항 컬럼(예: W)", value="W"),
+
+def _docx_shade_row(row, fill: str = "EFEFEF") -> None:
+    for cell in row.cells:
+        tcPr = cell._tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:fill"), fill)
+        tcPr.append(shd)
+
+
+def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
+    """
+    DF -> 피킹용 워드(.docx)
+    - A4 세로
+    - 행높이 26pt(정확히)
+    - 주소별 1페이지
+    - 코드 변경 시 음영 토글
+    - 폰트 규칙(최종 확정):
+        상단 주소 10
+        표안 주소열 5
+        주문상품 8, 옵션 8
+        주문수량 12(2이상 빨강)
+        상품연동코드 14 Bold
+        합계행 16 Bold + 합계행 주소칸 비움
+    """
+    required_cols = ["상품연동코드", "주문상품", "옵션", "주문수량", "주문회원", "주소", "주문요청사항"]
+    for c in required_cols:
+        if c not in df_final.columns:
+            raise ValueError(f"df_final에 '{c}' 컬럼이 없습니다. 현재 컬럼: {list(df_final.columns)}")
+
+    doc = Document()
+
+    # 페이지(세로) + 여백
+    section = doc.sections[0]
+    section.orientation = WD_ORIENT.PORTRAIT
+    section.page_width = Inches(8.27)   # A4
+    section.page_height = Inches(11.69) # A4
+    section.top_margin = Inches(0.35)
+    section.bottom_margin = Inches(0.35)
+    section.left_margin = Inches(0.35)
+    section.right_margin = Inches(0.35)
+
+    # 기본 폰트
+    style = doc.styles["Normal"]
+    style.font.name = "맑은 고딕"
+    style._element.rPr.rFonts.set(qn("w:eastAsia"), "맑은 고딕")
+    style.font.size = Pt(9)
+
+    # 주소별로 끊기(주소가 변경될 때마다 한 페이지)
+    # df_final은 이미 주소별로 모여 있고, 합계행도 포함되어 있음
+    # -> 주소값이 바뀌는 지점으로 그룹을 만든다.
+    groups = []
+    current_addr = None
+    current_rows = []
+
+    for _, row in df_final.iterrows():
+        addr = "" if pd.isna(row["주소"]) else str(row["주소"]).strip()
+        # 합계행도 주소를 갖고 있으니, 주소 그룹 기준은 동일하게 유지됨
+        if current_addr is None:
+            current_addr = addr
+            current_rows = [row]
+        elif addr == current_addr:
+            current_rows.append(row)
+        else:
+            groups.append((current_addr, current_rows))
+            current_addr = addr
+            current_rows = [row]
+    if current_rows:
+        groups.append((current_addr, current_rows))
+
+    # 컬럼 순서 고정
+    cols = required_cols[:]  # ["상품연동코드",...,"주문요청사항"]
+
+    # 세로모드 열 너비(인치) - 화면/인쇄에서 ‘잘 보이게’ 배분
+    col_widths = {
+        "상품연동코드": Inches(0.8),
+        "주문상품": Inches(2.4),
+        "옵션": Inches(1.4),
+        "주문수량": Inches(0.6),
+        "주문회원": Inches(1.0),
+        "주소": Inches(1.2),
+        "주문요청사항": Inches(1.1),
     }
 
-uploaded = st.file_uploader("원본 엑셀(.xlsx)을 업로드하세요", type=["xlsx"])
+    for gi, (addr, rows_in_addr) in enumerate(groups):
+        # 상단 주소(10pt)
+        p = doc.add_paragraph(f"주소: {addr}")
+        p.runs[0].bold = True
+        p.runs[0].font.size = Pt(10)
+        p.paragraph_format.space_after = Pt(4)
 
-if uploaded is not None:
-    st.info(f"업로드 파일: {uploaded.name}")
-    out_name = st.text_input("결과 파일명", value=f"picking_{Path(uploaded.name).stem}.xlsx")
+        table = doc.add_table(rows=1, cols=len(cols))
+        table.style = "Table Grid"
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.allow_autofit = False
 
-    if st.button("✅ 피킹시트 만들기", use_container_width=True):
-        try:
-            with st.spinner("처리 중..."):
-                with tempfile.TemporaryDirectory() as td:
-                    src_path = Path(td) / "src.xlsx"
-                    out_path = Path(td) / "out.xlsx"
+        # 헤더행(8pt) + 행높이 26
+        hdr = table.rows[0]
+        _docx_set_row_height(hdr, 26)
+        for ci, name in enumerate(cols):
+            cell = hdr.cells[ci]
+            cell.text = name
+            cell.width = col_widths[name]
+            if cell.paragraphs and cell.paragraphs[0].runs:
+                cell.paragraphs[0].runs[0].font.size = Pt(8)
 
-                    src_path.write_bytes(uploaded.getbuffer())
-                    build_picking_sheet(str(src_path), str(out_path), colmap=colmap)
-                    data = out_path.read_bytes()
+        # 코드 변경 시 음영 토글
+        last_code = None
+        shade_on = False
 
-            st.success("완료! 아래 버튼으로 다운로드하세요.")
-            st.download_button(
-                label="⬇️ 결과 엑셀 다운로드",
-                data=data,
-                file_name=out_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+        for r in rows_in_addr:
+            is_sum = (str(r.get("주문상품", "")) == "합계") or ("합계" in str(r.get("주문상품", "")))
 
-        except Exception as e:
-            st.error("처리 중 오류가 발생했습니다.")
-            st.exception(e)
-else:
-    st.warning("엑셀 파일을 업로드하면 시작할 수 있어요.")
+            # 코드 토글 기준: 합계행은 토글/음영 계산에서 제외(원래 사양 유지)
+            code_val = "" if pd.isna(r["상품연동코드"]) else str(r["상품연동코드"])
+            if not is_sum:
+                if code_val != last_code:
+                    shade_on = not shade_on
+                    last_code = code_val
+
+            row = table.add_row()
+            _docx_set_row_height(row, 26)
+
+            if shade_on and not is_sum:
+                _docx_shade_row(row, "EFEFEF")
+
+            for ci, name in enumerate(cols):
+                cell = row.cells[ci]
+                cell.width = col_widths[name]
+
+                # 합계행: 주소칸 비움(요구사항)
+                if is_sum and name == "주소":
+                    cell.text = ""
+                    continue
+
+                val = r.get(name, "")
+                text = "" if pd.isna(val) else str(val)
+
+                run = cell.paragraphs[0].add_run(text)
+
+                # 폰트 규칙(최종 확정)
+                if name == "주소":
+                    run.font.size = Pt(5)
+                elif name in ("주문상품", "옵션"):
+                    run.font.size = Pt(8)
+                elif name == "주문수량":
+                    run.font.size = Pt(12)
+                    try:
+                        if int(float(text)) >= 2:
+                            run.font.color.rgb = RGBColor(255, 0, 0)
+                    except:
+                        pass
+                elif name == "상품연동코드":
+                    run.font.size = Pt(14)
+                    run.bold = True
+                else:
+                    run.font.size = Pt(8)
+
+                # 합계행 전체 강조(16pt Bold) + 주소칸은 비움 처리됨
+                if is_sum:
+                    run.font.size = Pt(16)
+                    run.bold = True
+
+        if gi != len(groups) - 1:
+            doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+
+    doc.save(out_docx)
+
+
+def build_picking_sheet(
+    src_path: str,
+    out_xlsx_path: str,
+    colmap=None,
+    out_docx_path: str | None = None,
+    skip_xlsx: bool = False,
+):
+    if colmap is None:
+        # 원본 기준:
+        # 상품연동코드 J, 주문상품 K, 옵션 L,
+        # 주문수량 N, 주문회원 Q, 주소 V, 주문요청사항 W
+        colmap = {
+            "상품연동코드": "J",
+            "주문상품": "K",
+            "옵션": "L",
+            "주문수량": "N",
+            "주문회원": "Q",
+            "주소": "V",
+            "주문요청사항": "W",
+        }
+
+    # 1) DF 생성
+    df_final = build_picking_dataframe(src_path, colmap)
+
+    # 2) 엑셀 저장(선택)
+    if not skip_xlsx:
+        build_picking_xlsx(df_final, out_xlsx_path)
+
+    # 3) 워드 저장(선택)
+    if out_docx_path:
+        build_picking_docx(df_final, out_docx_path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("src", help='원본 엑셀 경로 (예: "원본.xlsx")')
+    parser.add_argument("out_xlsx", help='결과 엑셀 경로 (예: "결과.xlsx")')
+    parser.add_argument("--docx", dest="out_docx", default=None, help='결과 워드 경로 (예: "결과.docx")')
+    parser.add_argument("--skip-xlsx", action="store_true", help="엑셀 저장 생략(워드만 생성할 때)")
+    args = parser.parse_args()
+
+    build_picking_sheet(
+        src_path=args.src,
+        out_xlsx_path=args.out_xlsx,
+        out_docx_path=args.out_docx,
+        skip_xlsx=args.skip_xlsx,
+    )
+
+    if not args.skip_xlsx:
+        print(f"엑셀 완료: {args.out_xlsx}")
+    if args.out_docx:
+        print(f"워드 완료: {args.out_docx}")
+
+
+if __name__ == "__main__":
+    main()
