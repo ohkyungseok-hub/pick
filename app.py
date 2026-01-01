@@ -111,7 +111,7 @@ def build_picking_xlsx(df_final: pd.DataFrame, out_path: str, add_page_breaks: b
         "주문상품": 60,
         "옵션": 50,
         "주문수량": 10,
-        "주문회원": 18,
+        "수령자": 18,
         "주소": 50,
         "주문요청사항": 40,
     }
@@ -221,7 +221,7 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str, add_page_breaks: b
         상품연동코드 14 Bold
         합계행 16 Bold + 합계행 주소칸 비움
     """
-    required_cols = ["상품연동코드", "주문상품", "옵션", "주문수량", "주문회원", "주소", "주문요청사항"]
+    required_cols = ["상품연동코드", "주문상품", "옵션", "주문수량", "수령자", "주소", "주문요청사항"]
     for c in required_cols:
         if c not in df_final.columns:
             raise ValueError(f"df_final에 '{c}' 컬럼이 없습니다. 현재 컬럼: {list(df_final.columns)}")
@@ -273,7 +273,7 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str, add_page_breaks: b
         "주문상품": Inches(2.4),
         "옵션": Inches(1.4),
         "주문수량": Inches(0.6),
-        "주문회원": Inches(1.0),
+        "수령자": Inches(1.0),
         "주소": Inches(1.2),
         "주문요청사항": Inches(1.1),
     }
@@ -391,7 +391,7 @@ with st.expander("원본 컬럼 매핑(기본값: J,K,L,N,Q,V,W)"):
         "주문상품": "K",
         "옵션": "L",
         "주문수량": "N",
-        "주문회원": "Q",
+        "수령자": "R",
         "주소": "V",
         "주문요청사항": "W",
     }
