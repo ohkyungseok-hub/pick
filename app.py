@@ -182,10 +182,24 @@ def _docx_set_row_height(row, pt: int = 26) -> None:
     trPr.append(cantSplit)
 
     # 행높이 정확히
+    def _docx_set_row_height(row, pt: int = 26) -> None:
+    trPr = row._tr.get_or_add_trPr()
+
+    # 행 분할 금지 (페이지 경계에서 쪼개지지 않음)
+    cantSplit = OxmlElement("w:cantSplit")
+    trPr.append(cantSplit)
+
+    # ✅ 최소 높이만 지정 (내용에 따라 자동 확장)
     trHeight = OxmlElement("w:trHeight")
-    trHeight.set(qn("w:val"), str(int(pt * 20)))  # twips
-    trHeight.set(qn("w:hRule"), "exact")
+    trHeight.set(qn("w:val"), str(int(pt * 20)))  # 26pt
+    trHeight.set(qn("w:hRule"), "atLeast")        # 🔥 핵심 변경
     trPr.append(trHeight)
+
+    # 문단 여백 제거
+    for cell in row.cells:
+        for p in cell.paragraphs:
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
 
     # 셀 내부 문단 여백 최소화
     for cell in row.cells:
