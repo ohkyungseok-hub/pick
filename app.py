@@ -5,7 +5,6 @@
 # 요구 라이브러리:
 #   pip install streamlit pandas openpyxl python-docx
 
-import io
 import tempfile
 from pathlib import Path
 
@@ -26,7 +25,7 @@ from docx.shared import Pt, Inches, RGBColor
 
 
 # -----------------------
-# 공통 로직(원본 pick.py 그대로)
+# 기본 로직(원본과 동일)
 # -----------------------
 def excel_col_to_zero_index(col_letter: str) -> int:
     """Excel column letter (e.g., 'A', 'J') -> pandas zero-based index"""
@@ -72,8 +71,11 @@ def build_picking_dataframe(src_path: str, colmap: dict) -> pd.DataFrame:
     return df_final
 
 
-def build_picking_xlsx(df_final: pd.DataFrame, out_path: str) -> None:
-    """DF -> 피킹용 엑셀 저장 + 인쇄/서식 설정(openpyxl)"""
+def build_picking_xlsx(df_final: pd.DataFrame, out_path: str, add_page_breaks: bool = True) -> None:
+    """DF -> 피킹용 엑셀 저장 + 인쇄/서식 설정(openpyxl)
+    add_page_breaks=True : 주소 바뀔 때마다 페이지 나누기
+    add_page_breaks=False: 페이지 나누기 제거
+    """
     df_final.to_excel(out_path, index=False)
 
     wb = load_workbook(out_path)
@@ -96,7 +98,7 @@ def build_picking_xlsx(df_final: pd.DataFrame, out_path: str) -> None:
         for name in ["주문상품", "옵션", "주소", "주문요청사항"]:
             ws.cell(r, headers[name]).alignment = wrap_top
 
-    # 열 너비
+    # 열 너비(기존 유지)
     widths = {
         "상품연동코드": 18,
         "주문상품": 60,
@@ -109,21 +111,21 @@ def build_picking_xlsx(df_final: pd.DataFrame, out_path: str) -> None:
     for name, w in widths.items():
         ws.column_dimensions[get_column_letter(headers[name])].width = w
 
-    # 인쇄 설정(가로)
+    # 인쇄 설정(기존 유지: 가로)
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.print_title_rows = "1:1"
 
-    # 주소 바뀔 때마다 페이지 나누기
+    # 주소 바뀔 때마다 페이지 나누기(옵션)
     ws.row_breaks.brk = []
-    if ws.max_row >= 2:
+    if add_page_breaks and ws.max_row >= 2:
         prev_addr = ws.cell(2, addr_col).value
         for r in range(3, ws.max_row + 1):
             curr_addr = ws.cell(r, addr_col).value
             if curr_addr != prev_addr:
-                ws.row_breaks.append(Break(id=r - 1))
+                ws.row_breaks.append(Break(id=r - 1))  # 이전 행 뒤에서 끊기
                 prev_addr = curr_addr
 
     ws.print_area = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
@@ -155,12 +157,14 @@ def _docx_shade_row(row, fill: str = "EFEFEF") -> None:
         tcPr.append(shd)
 
 
-def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
+def build_picking_docx(df_final: pd.DataFrame, out_docx: str, add_page_breaks: bool = True) -> None:
     """
     DF -> 피킹용 워드(.docx)
     - A4 세로
     - 행높이 26pt(정확히)
-    - 주소별 1페이지
+    - 주소별로 표 생성
+    - add_page_breaks=True : 주소별 1페이지(페이지 나누기)
+    - add_page_breaks=False: 페이지 나누기 제거(연속 출력)
     - 코드 변경 시 음영 토글
     - 폰트 규칙(최종 확정):
         상단 주소 10
@@ -193,11 +197,10 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
     style._element.rPr.rFonts.set(qn("w:eastAsia"), "맑은 고딕")
     style.font.size = Pt(9)
 
-    # 주소별로 끊기
+    # 주소 그룹 만들기(기존 유지)
     groups = []
     current_addr = None
     current_rows = []
-
     for _, row in df_final.iterrows():
         addr = "" if pd.isna(row["주소"]) else str(row["주소"]).strip()
         if current_addr is None:
@@ -214,6 +217,7 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
 
     cols = required_cols[:]
 
+    # 세로모드 열 너비(인치) - 기존 유지
     col_widths = {
         "상품연동코드": Inches(0.8),
         "주문상품": Inches(2.4),
@@ -236,7 +240,7 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
         table.allow_autofit = False
 
-        # 헤더행
+        # 헤더행(8pt) + 행높이 26
         hdr = table.rows[0]
         _docx_set_row_height(hdr, 26)
         for ci, name in enumerate(cols):
@@ -246,6 +250,7 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
             if cell.paragraphs and cell.paragraphs[0].runs:
                 cell.paragraphs[0].runs[0].font.size = Pt(8)
 
+        # 코드 변경 시 음영 토글
         last_code = None
         shade_on = False
 
@@ -268,18 +273,18 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
                 cell = row.cells[ci]
                 cell.width = col_widths[name]
 
-                # 합계행: 주소칸 비움
+                # 합계행: 주소칸 비움(요구사항)
                 if is_sum and name == "주소":
                     cell.text = ""
                     continue
 
-                # 셀 초기화(빈 문단/중복 방지)
+                # 셀 초기화(중복 방지)
                 cell.text = ""
                 val = r.get(name, "")
                 text = "" if pd.isna(val) else str(val)
-
                 run = cell.paragraphs[0].add_run(text)
 
+                # 폰트 규칙(기존 유지)
                 if name == "주소":
                     run.font.size = Pt(5)
                 elif name in ("주문상품", "옵션"):
@@ -297,12 +302,17 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str) -> None:
                 else:
                     run.font.size = Pt(8)
 
+                # 합계행 강조(기존 유지)
                 if is_sum:
                     run.font.size = Pt(16)
                     run.bold = True
 
-        if gi != len(groups) - 1:
+        # 페이지 나누기(옵션)
+        if add_page_breaks and gi != len(groups) - 1:
             doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+        elif (not add_page_breaks) and gi != len(groups) - 1:
+            # 연속 출력일 때는 구분을 위해 여백만 조금 추가
+            doc.add_paragraph("")  # 빈 줄
 
     doc.save(out_docx)
 
@@ -314,8 +324,9 @@ st.set_page_config(page_title="피킹 시트 생성기", layout="wide")
 st.title("피킹 시트 생성기 (Excel → Picking XLSX / DOCX)")
 
 st.write(
-    "- 원본 엑셀을 업로드하면 **주소별 정렬 + 주소별 합계행**을 만들고\n"
-    "- 선택에 따라 **피킹용 XLSX(가로 인쇄 설정)**, **피킹용 DOCX(A4 세로)**를 생성합니다."
+    "- 원본 엑셀 업로드 → **주소별 정렬 + 주소별 합계행**\n"
+    "- 선택에 따라 **XLSX(가로 인쇄 설정)**, **DOCX(A4 세로)** 생성\n"
+    "- 추가 옵션: **페이지 나누기 제거 버전**도 함께 생성"
 )
 
 uploaded = st.file_uploader("원본 엑셀 업로드 (.xlsx)", type=["xlsx"])
@@ -341,6 +352,8 @@ with st.expander("원본 컬럼 매핑(기본값: J,K,L,N,Q,V,W)"):
 make_xlsx = st.checkbox("결과 XLSX 생성", value=True)
 make_docx = st.checkbox("결과 DOCX 생성", value=True)
 
+also_make_no_pagebreak = st.checkbox("페이지 나누기 제거 버전도 함께 생성", value=True)
+
 base_name = st.text_input("파일명 접두어(다운로드 파일명)", value="picking_result")
 
 run_btn = st.button("생성하기", type="primary", disabled=(uploaded is None))
@@ -355,7 +368,6 @@ if run_btn:
         st.stop()
 
     try:
-        # 업로드 파일을 임시 경로에 저장 (pandas/openpyxl/docx가 경로 기반으로 다루기 쉬움)
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             src_path = td_path / "source.xlsx"
@@ -367,31 +379,47 @@ if run_btn:
             st.success("데이터 변환 완료! (주소별 정렬 + 합계행 생성)")
             st.dataframe(df_final, use_container_width=True, height=360)
 
-            # 2) XLSX 생성
+            # 2) XLSX 생성(기본: 페이지 나누기 포함)
             if make_xlsx:
                 out_xlsx_path = td_path / f"{base_name}.xlsx"
-                build_picking_xlsx(df_final, str(out_xlsx_path))
-                xlsx_bytes = out_xlsx_path.read_bytes()
-
+                build_picking_xlsx(df_final, str(out_xlsx_path), add_page_breaks=True)
                 st.download_button(
-                    label="📥 결과 XLSX 다운로드",
-                    data=xlsx_bytes,
+                    label="📥 결과 XLSX 다운로드 (페이지 나누기 포함)",
+                    data=out_xlsx_path.read_bytes(),
                     file_name=f"{base_name}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-            # 3) DOCX 생성
+                if also_make_no_pagebreak:
+                    out_xlsx_np_path = td_path / f"{base_name}_nopagebreak.xlsx"
+                    build_picking_xlsx(df_final, str(out_xlsx_np_path), add_page_breaks=False)
+                    st.download_button(
+                        label="📥 결과 XLSX 다운로드 (페이지 나누기 제거)",
+                        data=out_xlsx_np_path.read_bytes(),
+                        file_name=f"{base_name}_nopagebreak.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+            # 3) DOCX 생성(기본: 주소별 페이지 나누기 포함)
             if make_docx:
                 out_docx_path = td_path / f"{base_name}.docx"
-                build_picking_docx(df_final, str(out_docx_path))
-                docx_bytes = out_docx_path.read_bytes()
-
+                build_picking_docx(df_final, str(out_docx_path), add_page_breaks=True)
                 st.download_button(
-                    label="📥 결과 DOCX 다운로드",
-                    data=docx_bytes,
+                    label="📥 결과 DOCX 다운로드 (주소별 페이지 나누기 포함)",
+                    data=out_docx_path.read_bytes(),
                     file_name=f"{base_name}.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
+
+                if also_make_no_pagebreak:
+                    out_docx_np_path = td_path / f"{base_name}_nopagebreak.docx"
+                    build_picking_docx(df_final, str(out_docx_np_path), add_page_breaks=False)
+                    st.download_button(
+                        label="📥 결과 DOCX 다운로드 (페이지 나누기 제거)",
+                        data=out_docx_np_path.read_bytes(),
+                        file_name=f"{base_name}_nopagebreak.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
 
     except Exception as e:
         st.error("생성 중 오류가 발생했습니다.")
