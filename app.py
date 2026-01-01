@@ -1,4 +1,9 @@
-# app.py (Streamlit 버전)
+# app.py (Streamlit 완성본)
+# - 기본 로직/컬럼 유지
+# - (옵션) 페이지 나누기 포함/제거 버전 둘 다 제공
+# - XLSX/DOCX 모두 "페이지 번호 항상 표시"
+# - DOCX: 표(행)가 페이지 경계에서 쪼개지지 않게(cantSplit) → 안 들어가면 다음 페이지로 통째로 이동
+#
 # 실행:
 #   streamlit run app.py
 #
@@ -42,7 +47,7 @@ def build_picking_dataframe(src_path: str, colmap: dict) -> pd.DataFrame:
     """원본 엑셀 -> 피킹용 DF(주소 정렬 + 주소별 합계행 포함)"""
     df = pd.read_excel(src_path)
 
-    need_keys = ["상품연동코드", "주문상품", "옵션", "주문수량", "주문회원", "주소", "주문요청사항"]
+    need_keys = ["상품연동코드", "주문상품", "옵션", "주문수량", "수령자", "주소", "주문요청사항"]
     idxs = [excel_col_to_zero_index(colmap[k]) for k in need_keys]
 
     df_sel = df.iloc[:, idxs].copy()
@@ -72,9 +77,11 @@ def build_picking_dataframe(src_path: str, colmap: dict) -> pd.DataFrame:
 
 
 def build_picking_xlsx(df_final: pd.DataFrame, out_path: str, add_page_breaks: bool = True) -> None:
-    """DF -> 피킹용 엑셀 저장 + 인쇄/서식 설정(openpyxl)
+    """
+    DF -> 피킹용 엑셀 저장 + 인쇄/서식 설정(openpyxl)
     add_page_breaks=True : 주소 바뀔 때마다 페이지 나누기
     add_page_breaks=False: 페이지 나누기 제거
+    + 페이지 번호(하단 중앙) 항상 표시
     """
     df_final.to_excel(out_path, index=False)
 
@@ -118,6 +125,10 @@ def build_picking_xlsx(df_final: pd.DataFrame, out_path: str, add_page_breaks: b
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.print_title_rows = "1:1"
 
+    # ✅ 페이지 번호 항상 표시(하단 중앙)
+    ws.oddFooter.center.text = "페이지 &P / &N"
+    ws.evenFooter.center.text = "페이지 &P / &N"
+
     # 주소 바뀔 때마다 페이지 나누기(옵션)
     ws.row_breaks.brk = []
     if add_page_breaks and ws.max_row >= 2:
@@ -135,8 +146,42 @@ def build_picking_xlsx(df_final: pd.DataFrame, out_path: str, add_page_breaks: b
 # -----------------------
 # 워드 출력 (세로모드 최종)
 # -----------------------
+def add_page_number_footer(section) -> None:
+    """워드 하단 중앙에 페이지 번호(PAGE 필드) 삽입"""
+    footer = section.footer
+    p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    p.alignment = 1  # CENTER
+
+    # 기존 내용이 있으면 덧붙지 않도록 초기화
+    if p.runs:
+        for r in p.runs:
+            r.text = ""
+
+    run = p.add_run()
+
+    fldChar1 = OxmlElement("w:fldChar")
+    fldChar1.set(qn("w:fldCharType"), "begin")
+
+    instrText = OxmlElement("w:instrText")
+    instrText.set(qn("xml:space"), "preserve")
+    instrText.text = " PAGE "
+
+    fldChar2 = OxmlElement("w:fldChar")
+    fldChar2.set(qn("w:fldCharType"), "end")
+
+    run._r.append(fldChar1)
+    run._r.append(instrText)
+    run._r.append(fldChar2)
+
+
 def _docx_set_row_height(row, pt: int = 26) -> None:
     trPr = row._tr.get_or_add_trPr()
+
+    # ✅ 행 분할 금지: 페이지 경계에서 행이 쪼개지지 않게
+    cantSplit = OxmlElement("w:cantSplit")
+    trPr.append(cantSplit)
+
+    # 행높이 정확히
     trHeight = OxmlElement("w:trHeight")
     trHeight.set(qn("w:val"), str(int(pt * 20)))  # twips
     trHeight.set(qn("w:hRule"), "exact")
@@ -166,6 +211,8 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str, add_page_breaks: b
     - add_page_breaks=True : 주소별 1페이지(페이지 나누기)
     - add_page_breaks=False: 페이지 나누기 제거(연속 출력)
     - 코드 변경 시 음영 토글
+    - ✅ 표 행이 페이지 경계에서 쪼개지지 않게(cantSplit) → 안 들어가면 다음 페이지로 이동
+    - ✅ 페이지 번호 항상 표시(하단 중앙)
     - 폰트 규칙(최종 확정):
         상단 주소 10
         표안 주소열 5
@@ -190,6 +237,9 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str, add_page_breaks: b
     section.bottom_margin = Inches(0.35)
     section.left_margin = Inches(0.35)
     section.right_margin = Inches(0.35)
+
+    # ✅ 페이지 번호 항상 표시
+    add_page_number_footer(section)
 
     # 기본 폰트
     style = doc.styles["Normal"]
@@ -229,18 +279,19 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str, add_page_breaks: b
     }
 
     for gi, (addr, rows_in_addr) in enumerate(groups):
-        # 상단 주소(10pt)
+        # 상단 주소(10pt) + 표와 붙이기(주소만 페이지 끝에 떨어지는 것 방지)
         p = doc.add_paragraph(f"주소: {addr}")
         p.runs[0].bold = True
         p.runs[0].font.size = Pt(10)
         p.paragraph_format.space_after = Pt(4)
+        p.paragraph_format.keep_with_next = True
 
         table = doc.add_table(rows=1, cols=len(cols))
         table.style = "Table Grid"
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
         table.allow_autofit = False
 
-        # 헤더행(8pt) + 행높이 26
+        # 헤더행(8pt) + 행높이 26 + cantSplit 적용됨
         hdr = table.rows[0]
         _docx_set_row_height(hdr, 26)
         for ci, name in enumerate(cols):
@@ -311,8 +362,8 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str, add_page_breaks: b
         if add_page_breaks and gi != len(groups) - 1:
             doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
         elif (not add_page_breaks) and gi != len(groups) - 1:
-            # 연속 출력일 때는 구분을 위해 여백만 조금 추가
-            doc.add_paragraph("")  # 빈 줄
+            # 연속 출력일 때는 구분을 위해 빈 줄
+            doc.add_paragraph("")
 
     doc.save(out_docx)
 
@@ -325,8 +376,10 @@ st.title("피킹 시트 생성기 (Excel → Picking XLSX / DOCX)")
 
 st.write(
     "- 원본 엑셀 업로드 → **주소별 정렬 + 주소별 합계행**\n"
-    "- 선택에 따라 **XLSX(가로 인쇄 설정)**, **DOCX(A4 세로)** 생성\n"
-    "- 추가 옵션: **페이지 나누기 제거 버전**도 함께 생성"
+    "- **XLSX / DOCX** 생성\n"
+    "- ✅ 페이지 번호 항상 표시\n"
+    "- ✅ DOCX 표 행은 페이지에서 쪼개지지 않음(안 들어가면 다음 페이지로 이동)\n"
+    "- (옵션) **페이지 나누기 제거 버전**도 함께 생성"
 )
 
 uploaded = st.file_uploader("원본 엑셀 업로드 (.xlsx)", type=["xlsx"])
@@ -351,11 +404,9 @@ with st.expander("원본 컬럼 매핑(기본값: J,K,L,N,Q,V,W)"):
 
 make_xlsx = st.checkbox("결과 XLSX 생성", value=True)
 make_docx = st.checkbox("결과 DOCX 생성", value=True)
-
 also_make_no_pagebreak = st.checkbox("페이지 나누기 제거 버전도 함께 생성", value=True)
 
 base_name = st.text_input("파일명 접두어(다운로드 파일명)", value="picking_result")
-
 run_btn = st.button("생성하기", type="primary", disabled=(uploaded is None))
 
 if run_btn:
