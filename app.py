@@ -384,14 +384,14 @@ st.write(
 
 uploaded = st.file_uploader("원본 엑셀 업로드 (.xlsx)", type=["xlsx"])
 
-with st.expander("원본 컬럼 매핑(기본값: J,K,L,N,R,V,W)"):
+with st.expander("원본 컬럼 매핑(기본값: J,K,L,N,S,V,W)"):
     st.caption("원본 엑셀에서 각 항목이 위치한 열(letter)을 입력하세요. 예: J")
     default_map = {
         "상품연동코드": "J",
         "주문상품": "K",
         "옵션": "L",
         "주문수량": "N",
-        "수령자": "R",
+        "수령자": "S",
         "주소": "V",
         "주문요청사항": "W",
     }
