@@ -694,7 +694,10 @@ if run_btn:
 
                 if preview_pdf:
                     st.subheader("PDF 미리보기")
-                    render_pdf_preview(pdf_bytes, height=900)
+                    def render_pdf_preview(pdf_bytes: bytes):
+                        st.subheader("PDF 미리보기")
+                        st.pdf(pdf_bytes)
+
 
     except Exception as e:
         st.error("생성 중 오류가 발생했습니다.")
