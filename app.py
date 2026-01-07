@@ -1,16 +1,18 @@
-# app.py (Streamlit 완성본)
+# app.py (Streamlit 통합본)
 # - 기본 로직/컬럼 유지
 # - (옵션) 페이지 나누기 포함/제거 버전 둘 다 제공
 # - XLSX/DOCX 모두 "페이지 번호 항상 표시"
 # - DOCX: 표(행)가 페이지 경계에서 쪼개지지 않게(cantSplit)
 # - DOCX: exact 고정 높이로 인한 "행 잘림" 방지 -> atLeast(최소 26pt)로 자동 확장
+# - ✅ 추가: "페이지 나누기 제거 DOCX"와 동일 목적의 PDF도 생성 + 화면 미리보기(iframe)
 #
 # 실행:
 #   streamlit run app.py
 #
 # 요구 라이브러리:
-#   pip install streamlit pandas openpyxl python-docx
+#   pip install streamlit pandas openpyxl python-docx reportlab
 
+import base64
 import tempfile
 from pathlib import Path
 
@@ -28,6 +30,15 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, Inches, RGBColor
+
+# PDF (ReportLab)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 
 # -----------------------
@@ -368,18 +379,204 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str, add_page_breaks: b
 
 
 # -----------------------
+# PDF 출력 (페이지 나누기 제거 DOCX와 동일 목적)
+# -----------------------
+def _register_korean_font_if_possible() -> str:
+    """
+    PDF 한글 표시를 위해 가능한 폰트를 등록하고 폰트명을 반환.
+    - 환경에 따라 폰트 파일이 없을 수 있으므로, 없으면 Helvetica로 fallback.
+    """
+    candidates = [
+        # Windows
+        r"C:\Windows\Fonts\malgun.ttf",
+        r"C:\Windows\Fonts\Malgun.ttf",
+        # macOS (일반적으로 시스템 폰트 접근이 제한될 수 있음)
+        "/System/Library/Fonts/AppleGothic.ttf",
+        # Linux (Nanum)
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ]
+
+    for p in candidates:
+        try:
+            path = Path(p)
+            if path.exists() and path.is_file():
+                font_name = "KOREAN_FONT"
+                pdfmetrics.registerFont(TTFont(font_name, str(path)))
+                return font_name
+        except Exception:
+            continue
+
+    return "Helvetica"
+
+
+def build_picking_pdf(df_final: pd.DataFrame, out_pdf: str, add_page_breaks: bool = False) -> str:
+    """
+    DF -> 피킹용 PDF
+    - A4 세로
+    - 페이지 번호(하단 중앙) 항상 표시
+    - 주소별로 블록 구성
+    - add_page_breaks=True  : 주소별 페이지 강제 분리(PageBreak)
+      add_page_breaks=False : 강제 분리 없이 연속 출력(자연 페이지네이션)  ✅ 추천(페이지 나누기 제거 목적)
+    - 표 행 분할 방지: NOSPLIT 적용
+    """
+    required_cols = ["상품연동코드", "주문상품", "옵션", "주문수량", "수령자", "주소", "주문요청사항"]
+    for c in required_cols:
+        if c not in df_final.columns:
+            raise ValueError(f"df_final에 '{c}' 컬럼이 없습니다. 현재 컬럼: {list(df_final.columns)}")
+
+    # 주소별 그룹 (DOCX 로직과 동일)
+    groups = []
+    current_addr = None
+    current_rows = []
+    for _, row in df_final.iterrows():
+        addr = "" if pd.isna(row["주소"]) else str(row["주소"]).strip()
+        if current_addr is None:
+            current_addr = addr
+            current_rows = [row]
+        elif addr == current_addr:
+            current_rows.append(row)
+        else:
+            groups.append((current_addr, current_rows))
+            current_addr = addr
+            current_rows = [row]
+    if current_rows:
+        groups.append((current_addr, current_rows))
+
+    font_name = _register_korean_font_if_possible()
+
+    styles = getSampleStyleSheet()
+    base = ParagraphStyle(
+        "base",
+        parent=styles["Normal"],
+        fontName=font_name,
+        fontSize=8,
+        leading=10,
+    )
+    title_style = ParagraphStyle(
+        "title",
+        parent=base,
+        fontSize=10,
+        leading=12,
+        spaceAfter=4,
+    )
+
+    # 페이지 번호
+    def draw_page_number(canvas, doc):
+        page_num = canvas.getPageNumber()
+        canvas.saveState()
+        canvas.setFont(font_name if font_name != "Helvetica" else "Helvetica", 9)
+        canvas.drawCentredString(A4[0] / 2.0, 10 * mm, f"{page_num}")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        out_pdf,
+        pagesize=A4,
+        leftMargin=9 * mm,
+        rightMargin=9 * mm,
+        topMargin=9 * mm,
+        bottomMargin=12 * mm,
+    )
+
+    flow = []
+    cols = required_cols[:]
+
+    # A4 세로 폭에 맞춘 컬럼 폭(mm)
+    col_widths = [18 * mm, 58 * mm, 34 * mm, 14 * mm, 22 * mm, 28 * mm, 26 * mm]
+
+    for gi, (addr, rows_in_addr) in enumerate(groups):
+        flow.append(Paragraph(f"주소: {addr}", title_style))
+
+        # 표 데이터
+        data = []
+        data.append([Paragraph(c, base) for c in cols])
+
+        last_code = None
+        shade_on = False
+        row_shaded = [False]  # header
+
+        for r in rows_in_addr:
+            is_sum = (str(r.get("주문상품", "")) == "합계") or ("합계" in str(r.get("주문상품", "")))
+            code_val = "" if pd.isna(r["상품연동코드"]) else str(r["상품연동코드"])
+
+            if not is_sum and code_val != last_code:
+                shade_on = not shade_on
+                last_code = code_val
+
+            row_vals = []
+            for name in cols:
+                if is_sum and name == "주소":
+                    row_vals.append("")
+                else:
+                    v = r.get(name, "")
+                    row_vals.append("" if pd.isna(v) else str(v))
+
+            # 셀은 Paragraph로(줄바꿈/자동 높이)
+            data.append([Paragraph(v.replace("\n", "<br/>"), base) for v in row_vals])
+            row_shaded.append(bool(shade_on and (not is_sum)))
+
+        t = Table(data, colWidths=col_widths, repeatRows=1)
+
+        ts = TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("FONT", (0, 0), (-1, -1), font_name, 8),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("ALIGN", (3, 1), (3, -1), "CENTER"),  # 주문수량
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ])
+
+        # 행 분할 방지: 각 행마다 NOSPLIT
+        for ri in range(0, len(data)):
+            ts.add("NOSPLIT", (0, ri), (-1, ri))
+
+        # 코드 변경 음영 토글
+        for ri in range(1, len(data)):
+            if row_shaded[ri]:
+                ts.add("BACKGROUND", (0, ri), (-1, ri), colors.whitesmoke)
+
+        t.setStyle(ts)
+        flow.append(t)
+        flow.append(Spacer(1, 6))
+
+        if add_page_breaks and gi != len(groups) - 1:
+            flow.append(PageBreak())
+
+    doc.build(flow, onFirstPage=draw_page_number, onLaterPages=draw_page_number)
+    return font_name
+
+
+def render_pdf_preview(pdf_bytes: bytes, height: int = 900) -> None:
+    """Streamlit 페이지에서 PDF를 바로 미리보기(iframe)"""
+    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    pdf_html = f"""
+    <iframe
+        src="data:application/pdf;base64,{b64}"
+        width="100%"
+        height="{height}"
+        style="border:none;"
+    ></iframe>
+    """
+    st.markdown(pdf_html, unsafe_allow_html=True)
+
+
+# -----------------------
 # Streamlit UI
 # -----------------------
 st.set_page_config(page_title="피킹 시트 생성기", layout="wide")
-st.title("피킹 시트 생성기 (Excel → Picking XLSX / DOCX)")
+st.title("피킹 시트 생성기 (Excel → Picking XLSX / DOCX / PDF)")
 
 st.write(
     "- 원본 엑셀 업로드 → **주소별 정렬 + 주소별 합계행**\n"
-    "- **XLSX / DOCX** 생성\n"
-    "- ✅ 페이지 번호 항상 표시\n"
+    "- **XLSX / DOCX / PDF** 생성\n"
+    "- ✅ 페이지 번호 항상 표시(XLSX/DOCX/PDF)\n"
     "- ✅ DOCX 표 행은 페이지에서 쪼개지지 않음(안 들어가면 다음 페이지로 이동)\n"
     "- ✅ DOCX 행 잘림 방지(최소 26pt + 자동 확장)\n"
-    "- (옵션) **페이지 나누기 제거 버전**도 함께 생성"
+    "- (옵션) **페이지 나누기 제거 버전**도 함께 생성\n"
+    "- ✅ PDF는 앱 화면에서 바로 미리보기 가능(한 페이지씩 스크롤로 확인)"
 )
 
 uploaded = st.file_uploader("원본 엑셀 업로드 (.xlsx)", type=["xlsx"])
@@ -404,6 +601,11 @@ with st.expander("원본 컬럼 매핑(기본값: J,K,L,N,S,V,W)"):
 
 make_xlsx = st.checkbox("결과 XLSX 생성", value=True)
 make_docx = st.checkbox("결과 DOCX 생성", value=True)
+
+# ✅ 추가: PDF(페이지 나누기 제거 목적)
+make_pdf = st.checkbox("결과 PDF 생성(페이지 나누기 제거 목적)", value=True)
+preview_pdf = st.checkbox("PDF를 화면에서 바로 미리보기", value=True)
+
 also_make_no_pagebreak = st.checkbox("페이지 나누기 제거 버전도 함께 생성", value=True)
 
 base_name = st.text_input("파일명 접두어(다운로드 파일명)", value="picking_result")
@@ -414,8 +616,8 @@ if run_btn:
         st.error("원본 엑셀 파일을 업로드하세요.")
         st.stop()
 
-    if not (make_xlsx or make_docx):
-        st.warning("XLSX 또는 DOCX 중 최소 1개는 선택해야 합니다.")
+    if not (make_xlsx or make_docx or make_pdf):
+        st.warning("XLSX/DOCX/PDF 중 최소 1개는 선택해야 합니다.")
         st.stop()
 
     try:
@@ -471,6 +673,28 @@ if run_btn:
                         file_name=f"{base_name}_nopagebreak.docx",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     )
+
+            # 4) ✅ PDF 생성: "페이지 나누기 제거" 목적(자연 페이지네이션)
+            #    - also_make_no_pagebreak 여부와 무관하게, 목적 자체가 '제거'이므로 PDF는 제거 버전으로 생성
+            if make_pdf:
+                out_pdf_np_path = td_path / f"{base_name}_nopagebreak.pdf"
+                font_used = build_picking_pdf(df_final, str(out_pdf_np_path), add_page_breaks=False)
+
+                pdf_bytes = out_pdf_np_path.read_bytes()
+
+                st.download_button(
+                    label="📥 결과 PDF 다운로드 (페이지 나누기 제거/자연 페이지네이션)",
+                    data=pdf_bytes,
+                    file_name=f"{base_name}_nopagebreak.pdf",
+                    mime="application/pdf",
+                )
+
+                if font_used == "Helvetica":
+                    st.info("PDF 한글 폰트 파일을 찾지 못해 기본 폰트로 생성했습니다. (환경에 따라 한글이 깨질 수 있어요)")
+
+                if preview_pdf:
+                    st.subheader("PDF 미리보기")
+                    render_pdf_preview(pdf_bytes, height=900)
 
     except Exception as e:
         st.error("생성 중 오류가 발생했습니다.")
