@@ -1,18 +1,32 @@
-# app.py (Streamlit 통합본)
+# app.py (Streamlit Cloud 최종 통합본 - 오타/버그 수정 완료)
+# ------------------------------------------------------------
 # - 기본 로직/컬럼 유지
 # - (옵션) 페이지 나누기 포함/제거 버전 둘 다 제공
-# - XLSX/DOCX 모두 "페이지 번호 항상 표시"
+# - XLSX/DOCX/PDF 모두 "페이지 번호 항상 표시"
 # - DOCX: 표(행)가 페이지 경계에서 쪼개지지 않게(cantSplit)
 # - DOCX: exact 고정 높이로 인한 "행 잘림" 방지 -> atLeast(최소 26pt)로 자동 확장
-# - ✅ 추가: "페이지 나누기 제거 DOCX"와 동일 목적의 PDF도 생성 + 화면 미리보기(iframe)
+# - ✅ PDF: ReportLab로 직접 생성(한글 폰트 프로젝트 포함 방식)
+# - ✅ Streamlit Cloud에서 PDF 미리보기: st.pdf() 사용(iframe/base64 방식 X)
 #
 # 실행:
 #   streamlit run app.py
 #
-# 요구 라이브러리:
-#   pip install streamlit pandas openpyxl python-docx reportlab
+# requirements.txt 예시:
+#   streamlit>=1.28
+#   pandas
+#   openpyxl
+#   python-docx
+#   reportlab
+#
+# 폰트 배치(중요: Streamlit Cloud):
+#   repo_root/
+#     app.py
+#     requirements.txt
+#     fonts/
+#       NanumGothic.ttf
+#       NanumGothicBold.ttf   (선택)
+# ------------------------------------------------------------
 
-import base64
 import tempfile
 from pathlib import Path
 
@@ -31,14 +45,20 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, Inches, RGBColor
 
-# PDF (ReportLab)
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+# ---- PDF (ReportLab)
+REPORTLAB_OK = True
+REPORTLAB_ERR = ""
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+except ModuleNotFoundError as e:
+    REPORTLAB_OK = False
+    REPORTLAB_ERR = str(e)
 
 
 # -----------------------
@@ -379,48 +399,41 @@ def build_picking_docx(df_final: pd.DataFrame, out_docx: str, add_page_breaks: b
 
 
 # -----------------------
-# PDF 출력 (페이지 나누기 제거 DOCX와 동일 목적)
+# PDF 출력 (Streamlit Cloud: 프로젝트 폰트 사용)
 # -----------------------
-def _register_korean_font_if_possible() -> str:
+def _register_korean_font_from_project() -> tuple[str, str, bool]:
     """
-    PDF 한글 표시를 위해 가능한 폰트를 등록하고 폰트명을 반환.
-    - 환경에 따라 폰트 파일이 없을 수 있으므로, 없으면 Helvetica로 fallback.
+    프로젝트 내 ./fonts 폴더의 폰트를 PDF에 등록하여 한글(■) 깨짐 방지.
+    - repo_root/fonts/NanumGothic.ttf 필수
+    - repo_root/fonts/NanumGothicBold.ttf 선택
+    반환: (regular_font_name, bold_font_name, font_ok)
     """
-    candidates = [
-        # Windows
-        r"C:\Windows\Fonts\malgun.ttf",
-        r"C:\Windows\Fonts\Malgun.ttf",
-        # macOS (일반적으로 시스템 폰트 접근이 제한될 수 있음)
-        "/System/Library/Fonts/AppleGothic.ttf",
-        # Linux (Nanum)
-        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-        "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    ]
+    base_dir = Path(__file__).parent
+    regular_path = base_dir / "fonts" / "NanumGothic.ttf"
+    bold_path = base_dir / "fonts" / "NanumGothicBold.ttf"
 
-    for p in candidates:
-        try:
-            path = Path(p)
-            if path.exists() and path.is_file():
-                font_name = "KOREAN_FONT"
-                pdfmetrics.registerFont(TTFont(font_name, str(path)))
-                return font_name
-        except Exception:
-            continue
+    if not regular_path.exists():
+        return "Helvetica", "Helvetica-Bold", False
 
-    return "Helvetica"
+    pdfmetrics.registerFont(TTFont("KOREAN", str(regular_path)))
+    if bold_path.exists():
+        pdfmetrics.registerFont(TTFont("KOREAN_B", str(bold_path)))
+    else:
+        pdfmetrics.registerFont(TTFont("KOREAN_B", str(regular_path)))
+
+    return "KOREAN", "KOREAN_B", True
 
 
-def build_picking_pdf(df_final: pd.DataFrame, out_pdf: str, add_page_breaks: bool = False) -> str:
+def build_picking_pdf(df_final: pd.DataFrame, out_pdf: str, add_page_breaks: bool = False) -> tuple[str, bool]:
     """
     DF -> 피킹용 PDF
     - A4 세로
     - 페이지 번호(하단 중앙) 항상 표시
     - 주소별로 블록 구성
     - add_page_breaks=True  : 주소별 페이지 강제 분리(PageBreak)
-      add_page_breaks=False : 강제 분리 없이 연속 출력(자연 페이지네이션)  ✅ 추천(페이지 나누기 제거 목적)
+      add_page_breaks=False : 강제 분리 없이 연속 출력(자연 페이지네이션) ✅(페이지 나누기 제거 목적)
     - 표 행 분할 방지: NOSPLIT 적용
+    반환: (font_used, font_ok)
     """
     required_cols = ["상품연동코드", "주문상품", "옵션", "주문수량", "수령자", "주소", "주문요청사항"]
     for c in required_cols:
@@ -445,33 +458,33 @@ def build_picking_pdf(df_final: pd.DataFrame, out_pdf: str, add_page_breaks: boo
     if current_rows:
         groups.append((current_addr, current_rows))
 
-    font_name = _register_korean_font_if_possible()
+    font_regular, font_bold, font_ok = _register_korean_font_from_project()
 
     styles = getSampleStyleSheet()
     base = ParagraphStyle(
         "base",
         parent=styles["Normal"],
-        fontName=font_name,
+        fontName=font_regular,
         fontSize=8,
         leading=10,
     )
     title_style = ParagraphStyle(
         "title",
         parent=base,
+        fontName=font_bold,
         fontSize=10,
         leading=12,
         spaceAfter=4,
     )
 
-    # 페이지 번호
     def draw_page_number(canvas, doc):
         page_num = canvas.getPageNumber()
         canvas.saveState()
-        canvas.setFont(font_name if font_name != "Helvetica" else "Helvetica", 9)
+        canvas.setFont(font_regular, 9)
         canvas.drawCentredString(A4[0] / 2.0, 10 * mm, f"{page_num}")
         canvas.restoreState()
 
-    doc = SimpleDocTemplate(
+    pdf_doc = SimpleDocTemplate(
         out_pdf,
         pagesize=A4,
         leftMargin=9 * mm,
@@ -489,9 +502,9 @@ def build_picking_pdf(df_final: pd.DataFrame, out_pdf: str, add_page_breaks: boo
     for gi, (addr, rows_in_addr) in enumerate(groups):
         flow.append(Paragraph(f"주소: {addr}", title_style))
 
-        # 표 데이터
+        # 표 데이터(Paragraph로 넣어 줄바꿈/자동높이)
         data = []
-        data.append([Paragraph(c, base) for c in cols])
+        data.append([Paragraph(str(c), base) for c in cols])
 
         last_code = None
         shade_on = False
@@ -513,7 +526,6 @@ def build_picking_pdf(df_final: pd.DataFrame, out_pdf: str, add_page_breaks: boo
                     v = r.get(name, "")
                     row_vals.append("" if pd.isna(v) else str(v))
 
-            # 셀은 Paragraph로(줄바꿈/자동 높이)
             data.append([Paragraph(v.replace("\n", "<br/>"), base) for v in row_vals])
             row_shaded.append(bool(shade_on and (not is_sum)))
 
@@ -522,9 +534,16 @@ def build_picking_pdf(df_final: pd.DataFrame, out_pdf: str, add_page_breaks: boo
         ts = TableStyle([
             ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("FONT", (0, 0), (-1, -1), font_name, 8),
+
+            ("FONTNAME", (0, 0), (-1, -1), font_regular),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+
+            ("FONTNAME", (0, 0), (-1, 0), font_bold),
+            ("FONTSIZE", (0, 0), (-1, 0), 8),
+
             ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-            ("ALIGN", (3, 1), (3, -1), "CENTER"),  # 주문수량
+            ("ALIGN", (3, 1), (3, -1), "CENTER"),
+
             ("TOPPADDING", (0, 0), (-1, -1), 2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
         ])
@@ -545,22 +564,8 @@ def build_picking_pdf(df_final: pd.DataFrame, out_pdf: str, add_page_breaks: boo
         if add_page_breaks and gi != len(groups) - 1:
             flow.append(PageBreak())
 
-    doc.build(flow, onFirstPage=draw_page_number, onLaterPages=draw_page_number)
-    return font_name
-
-
-def render_pdf_preview(pdf_bytes: bytes, height: int = 900) -> None:
-    """Streamlit 페이지에서 PDF를 바로 미리보기(iframe)"""
-    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-    pdf_html = f"""
-    <iframe
-        src="data:application/pdf;base64,{b64}"
-        width="100%"
-        height="{height}"
-        style="border:none;"
-    ></iframe>
-    """
-    st.markdown(pdf_html, unsafe_allow_html=True)
+    pdf_doc.build(flow, onFirstPage=draw_page_number, onLaterPages=draw_page_number)
+    return font_regular, font_ok
 
 
 # -----------------------
@@ -576,7 +581,7 @@ st.write(
     "- ✅ DOCX 표 행은 페이지에서 쪼개지지 않음(안 들어가면 다음 페이지로 이동)\n"
     "- ✅ DOCX 행 잘림 방지(최소 26pt + 자동 확장)\n"
     "- (옵션) **페이지 나누기 제거 버전**도 함께 생성\n"
-    "- ✅ PDF는 앱 화면에서 바로 미리보기 가능(한 페이지씩 스크롤로 확인)"
+    "- ✅ PDF는 Streamlit Cloud에서 **st.pdf**로 바로 미리보기"
 )
 
 uploaded = st.file_uploader("원본 엑셀 업로드 (.xlsx)", type=["xlsx"])
@@ -602,9 +607,14 @@ with st.expander("원본 컬럼 매핑(기본값: J,K,L,N,S,V,W)"):
 make_xlsx = st.checkbox("결과 XLSX 생성", value=True)
 make_docx = st.checkbox("결과 DOCX 생성", value=True)
 
-# ✅ 추가: PDF(페이지 나누기 제거 목적)
-make_pdf = st.checkbox("결과 PDF 생성(페이지 나누기 제거 목적)", value=True)
-preview_pdf = st.checkbox("PDF를 화면에서 바로 미리보기", value=True)
+if not REPORTLAB_OK:
+    st.warning(
+        "PDF 기능을 사용하려면 reportlab 설치가 필요합니다. requirements.txt에 reportlab을 추가하세요.\n"
+        f"(현재 오류: {REPORTLAB_ERR})"
+    )
+
+make_pdf = st.checkbox("결과 PDF 생성(페이지 나누기 제거 목적)", value=True, disabled=not REPORTLAB_OK)
+preview_pdf = st.checkbox("PDF를 화면에서 바로 미리보기", value=True, disabled=not REPORTLAB_OK)
 
 also_make_no_pagebreak = st.checkbox("페이지 나누기 제거 버전도 함께 생성", value=True)
 
@@ -631,6 +641,11 @@ if run_btn:
 
             st.success("데이터 변환 완료! (주소별 정렬 + 합계행 생성)")
             st.dataframe(df_final, use_container_width=True, height=360)
+
+            # (진단) 폰트 파일 존재 여부 표시(Cloud에서 유용)
+            font_path = Path(__file__).parent / "fonts" / "NanumGothic.ttf"
+            if make_pdf and REPORTLAB_OK:
+                st.caption(f"폰트 경로 확인: {font_path} / exists={font_path.exists()}")
 
             # 2) XLSX 생성(기본: 페이지 나누기 포함)
             if make_xlsx:
@@ -674,12 +689,10 @@ if run_btn:
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     )
 
-            # 4) ✅ PDF 생성: "페이지 나누기 제거" 목적(자연 페이지네이션)
-            #    - also_make_no_pagebreak 여부와 무관하게, 목적 자체가 '제거'이므로 PDF는 제거 버전으로 생성
-            if make_pdf:
+            # 4) PDF 생성(페이지 나누기 제거 목적)
+            if make_pdf and REPORTLAB_OK:
                 out_pdf_np_path = td_path / f"{base_name}_nopagebreak.pdf"
-                font_used = build_picking_pdf(df_final, str(out_pdf_np_path), add_page_breaks=False)
-
+                font_used, font_ok = build_picking_pdf(df_final, str(out_pdf_np_path), add_page_breaks=False)
                 pdf_bytes = out_pdf_np_path.read_bytes()
 
                 st.download_button(
@@ -689,15 +702,18 @@ if run_btn:
                     mime="application/pdf",
                 )
 
-                if font_used == "Helvetica":
-                    st.info("PDF 한글 폰트 파일을 찾지 못해 기본 폰트로 생성했습니다. (환경에 따라 한글이 깨질 수 있어요)")
+                if not font_ok:
+                    st.warning(
+                        "PDF 한글 폰트 등록에 실패해 기본 폰트로 생성되었습니다(한글이 ■로 깨질 수 있어요). "
+                        "repo_root/fonts/NanumGothic.ttf가 있는지 확인하세요."
+                    )
+                else:
+                    st.caption(f"PDF 폰트 적용: {font_used}")
 
                 if preview_pdf:
                     st.subheader("PDF 미리보기")
-                    def render_pdf_preview(pdf_bytes: bytes):
-                        st.subheader("PDF 미리보기")
-                        st.pdf(pdf_bytes)
-
+                    # Streamlit Cloud에서 iframe/base64 대신 st.pdf 사용
+                    st.pdf(pdf_bytes)
 
     except Exception as e:
         st.error("생성 중 오류가 발생했습니다.")
