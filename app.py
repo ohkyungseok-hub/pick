@@ -27,6 +27,7 @@
 #       NanumGothicBold.ttf   (선택)
 # ------------------------------------------------------------
 
+import re
 import tempfile
 from pathlib import Path
 
@@ -62,6 +63,67 @@ except ModuleNotFoundError as e:
 
 
 # -----------------------
+# 컬럼 자동 매칭 유틸
+# -----------------------
+def norm_header(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[()\-_/.,·:]", "", s)
+    return s
+
+AUTO_HEADER_CANDIDATES = {
+    "상품연동코드": [
+        "상품연동코드", "상품관리코드", "판매자관리코드", "판매자 관리코드",
+        "상품코드", "품목코드", "sku", "sku번호"
+    ],
+    "주문상품": [
+        "주문상품", "상품명", "주문상품명", "노출상품명", "노출상품명(옵션명)"
+    ],
+    "옵션": [
+        "옵션", "옵션명", "옵션정보", "옵션명:옵션값", "옵션값"
+    ],
+    "주문수량": [
+        "주문수량", "수량", "구매수", "구매수량", "qty"
+    ],
+    "수령자": [
+        "수령자", "수령자명", "수취인", "수취인명", "받는분", "받는분성명"
+    ],
+    "주소": [
+        "주소", "배송지주소", "수취인주소", "받는분주소", "받는분주소(전체,분할)"
+    ],
+    "주문요청사항": [
+        "주문요청사항", "주문메모", "배송메모", "배송요청사항", "배송메시지", "배송메세지"
+    ],
+}
+
+def find_header_col(df: pd.DataFrame, candidates: list[str]):
+    norm_map = {norm_header(c): c for c in df.columns}
+
+    # 완전 일치
+    for cand in candidates:
+        nc = norm_header(cand)
+        if nc in norm_map:
+            return norm_map[nc]
+
+    # 부분 포함
+    for nc_df, original in norm_map.items():
+        for cand in candidates:
+            nc = norm_header(cand)
+            if nc and (nc in nc_df or nc_df in nc):
+                return original
+
+    return None
+
+def auto_detect_colmap(df: pd.DataFrame) -> dict:
+    detected = {}
+    for key, candidates in AUTO_HEADER_CANDIDATES.items():
+        detected[key] = find_header_col(df, candidates)
+    return detected
+
+
+# -----------------------
 # 기본 로직(원본과 동일)
 # -----------------------
 def excel_col_to_zero_index(col_letter: str) -> int:
@@ -75,20 +137,37 @@ def excel_col_to_zero_index(col_letter: str) -> int:
     return n - 1
 
 
-def build_picking_dataframe(src_path: str, colmap: dict) -> pd.DataFrame:
+def build_picking_dataframe(src_path: str, colmap: dict | None = None) -> tuple[pd.DataFrame, dict]:
     """원본 엑셀 -> 피킹용 DF(주소 정렬 + 주소별 합계행 포함)"""
     df = pd.read_excel(src_path)
 
     need_keys = ["상품연동코드", "주문상품", "옵션", "주문수량", "수령자", "주소", "주문요청사항"]
 
-    # 매핑 누락 방지 (사용자에게 친절하게 에러)
-    missing = [k for k in need_keys if k not in colmap or not str(colmap[k]).strip()]
+    # 1) 헤더 자동 탐지
+    detected_map = auto_detect_colmap(df)
+
+    # 2) 수동 입력(colmap)이 있으면 수동값 우선, 없으면 자동값 사용
+    final_cols = {}
+    for k in need_keys:
+        user_val = (colmap or {}).get(k, "")
+        user_val = str(user_val).strip() if user_val is not None else ""
+
+        if user_val:
+            idx = excel_col_to_zero_index(user_val)
+            if idx >= df.shape[1]:
+                raise ValueError(f"{k}: 입력한 열 {user_val} 이 실제 컬럼 범위를 벗어났습니다.")
+            final_cols[k] = df.columns[idx]
+        else:
+            final_cols[k] = detected_map.get(k)
+
+    missing = [k for k in need_keys if not final_cols.get(k)]
     if missing:
-        raise ValueError(f"컬럼 매핑이 없습니다/비었습니다: {missing} (Streamlit에서 열(letter)을 입력하세요)")
+        raise ValueError(
+            f"자동 매칭 실패 컬럼: {missing}\n"
+            f"현재 파일 헤더: {list(df.columns)}"
+        )
 
-    idxs = [excel_col_to_zero_index(colmap[k]) for k in need_keys]
-
-    df_sel = df.iloc[:, idxs].copy()
+    df_sel = df[[final_cols[k] for k in need_keys]].copy()
     df_sel.columns = need_keys
 
     # 정렬: 주소(오름), 상품연동코드(내림)
@@ -111,7 +190,7 @@ def build_picking_dataframe(src_path: str, colmap: dict) -> pd.DataFrame:
         out_chunks.append(pd.DataFrame([subtotal]))
 
     df_final = pd.concat(out_chunks, ignore_index=True)
-    return df_final
+    return df_final, final_cols
 
 
 def build_picking_xlsx(df_final: pd.DataFrame, out_path: str, add_page_breaks: bool = True) -> None:
@@ -586,16 +665,16 @@ st.write(
 
 uploaded = st.file_uploader("원본 엑셀 업로드 (.xlsx)", type=["xlsx"])
 
-with st.expander("원본 컬럼 매핑(기본값: J,K,L,N,S,V,W)"):
-    st.caption("원본 엑셀에서 각 항목이 위치한 열(letter)을 입력하세요. 예: J")
+with st.expander("원본 컬럼 매핑(비워두면 헤더명으로 자동 매칭)"):
+    st.caption("비워두면 헤더명으로 자동 매칭합니다. 자동 매칭이 안 될 때만 열(letter)을 입력하세요. 예: J")
     default_map = {
-        "상품연동코드": "J",
-        "주문상품": "K",
-        "옵션": "L",
-        "주문수량": "N",
-        "수령자": "S",
-        "주소": "V",
-        "주문요청사항": "W",
+        "상품연동코드": "",
+        "주문상품": "",
+        "옵션": "",
+        "주문수량": "",
+        "수령자": "",
+        "주소": "",
+        "주문요청사항": "",
     }
     colmap = {}
     cols_ui = st.columns(len(default_map))
@@ -637,9 +716,11 @@ if run_btn:
             src_path.write_bytes(uploaded.getvalue())
 
             # 1) DF 생성
-            df_final = build_picking_dataframe(str(src_path), colmap)
+            df_final, detected_cols = build_picking_dataframe(str(src_path), colmap)
 
             st.success("데이터 변환 완료! (주소별 정렬 + 합계행 생성)")
+            st.caption("자동/최종 매칭 컬럼")
+            st.json(detected_cols)
             st.dataframe(df_final, use_container_width=True, height=360)
 
             # (진단) 폰트 파일 존재 여부 표시(Cloud에서 유용)
