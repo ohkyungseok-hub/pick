@@ -98,6 +98,30 @@ AUTO_HEADER_CANDIDATES = {
     ],
 }
 
+KNOWN_IMPORT_FORMATS = [
+    {
+        "name": "결제완료 리스트",
+        "required_keys": ["상품연동코드", "주문상품", "옵션", "주문수량", "수령자", "주소"],
+        "columns": {
+            "상품연동코드": "R",
+            "주문상품": "T",
+            "옵션": "X",
+            "주문수량": "AD",
+            "수령자": "AM",
+            "주소": "AP",
+            "주문요청사항": "F",
+        },
+        "expected_headers": {
+            "상품연동코드": "상품관리코드",
+            "주문상품": "상품명",
+            "옵션": "옵션명:옵션값",
+            "주문수량": "수량",
+            "수령자": "수령자명",
+            "주소": "주소",
+        },
+    },
+]
+
 def find_header_col(df: pd.DataFrame, candidates: list[str]):
     norm_map = {norm_header(c): c for c in df.columns}
 
@@ -115,6 +139,35 @@ def find_header_col(df: pd.DataFrame, candidates: list[str]):
                 return original
 
     return None
+
+def get_df_col_by_excel_letter(df: pd.DataFrame, col_letter: str):
+    idx = excel_col_to_zero_index(col_letter)
+    if idx >= df.shape[1]:
+        return None
+    return df.columns[idx]
+
+def detect_known_import_format(df: pd.DataFrame) -> tuple[dict, str | None]:
+    for fmt in KNOWN_IMPORT_FORMATS:
+        expected_headers = fmt["expected_headers"]
+        matched = True
+        for key in fmt["required_keys"]:
+            source_col = get_df_col_by_excel_letter(df, fmt["columns"][key])
+            if source_col is None:
+                matched = False
+                break
+            if norm_header(source_col) != norm_header(expected_headers[key]):
+                matched = False
+                break
+
+        if matched:
+            detected = {}
+            for key, col_letter in fmt["columns"].items():
+                source_col = get_df_col_by_excel_letter(df, col_letter)
+                if source_col is not None:
+                    detected[key] = source_col
+            return detected, fmt["name"]
+
+    return {}, None
 
 def auto_detect_colmap(df: pd.DataFrame) -> dict:
     detected = {}
@@ -142,11 +195,13 @@ def build_picking_dataframe(src_path: str, colmap: dict | None = None) -> tuple[
     df = pd.read_excel(src_path)
 
     need_keys = ["상품연동코드", "주문상품", "옵션", "주문수량", "수령자", "주소", "주문요청사항"]
+    optional_keys = {"주문요청사항"}
 
     # 1) 헤더 자동 탐지
     detected_map = auto_detect_colmap(df)
+    known_format_map, known_format_name = detect_known_import_format(df)
 
-    # 2) 수동 입력(colmap)이 있으면 수동값 우선, 없으면 자동값 사용
+    # 2) 수동 입력(colmap)이 있으면 수동값 우선, 없으면 자동값/알려진 양식값 사용
     final_cols = {}
     for k in need_keys:
         user_val = (colmap or {}).get(k, "")
@@ -158,17 +213,26 @@ def build_picking_dataframe(src_path: str, colmap: dict | None = None) -> tuple[
                 raise ValueError(f"{k}: 입력한 열 {user_val} 이 실제 컬럼 범위를 벗어났습니다.")
             final_cols[k] = df.columns[idx]
         else:
-            final_cols[k] = detected_map.get(k)
+            final_cols[k] = detected_map.get(k) or known_format_map.get(k)
 
-    missing = [k for k in need_keys if not final_cols.get(k)]
+    missing = [k for k in need_keys if k not in optional_keys and not final_cols.get(k)]
     if missing:
         raise ValueError(
             f"자동 매칭 실패 컬럼: {missing}\n"
             f"현재 파일 헤더: {list(df.columns)}"
         )
 
-    df_sel = df[[final_cols[k] for k in need_keys]].copy()
-    df_sel.columns = need_keys
+    df_sel = pd.DataFrame()
+    for k in need_keys:
+        source_col = final_cols.get(k)
+        if source_col:
+            df_sel[k] = df[source_col]
+        else:
+            df_sel[k] = ""
+            final_cols[k] = "(빈 값)"
+
+    if known_format_name:
+        final_cols["_인식양식"] = known_format_name
 
     # 정렬: 주소(오름), 상품연동코드(내림)
     df_sorted = df_sel.sort_values(
